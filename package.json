@@ -1,0 +1,14 @@
+{
+  "name": "discord-emulator-control",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "register": "node register-commands.js",
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.5"
+  }
+}
