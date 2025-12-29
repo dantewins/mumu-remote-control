@@ -986,7 +986,7 @@ client.on("interactionCreate", async (interaction) => {
             if (sub === "status") {
                 const enabled = config.farm.enabled ? "enabled" : "disabled";
                 const lines = [
-                    `Monitor: ${enabled}`,
+                    `MonitorPOOPLORD: ${enabled}`,
                     `placeId: ${config.farm.placeId}`,
                     `poll: ${config.farm.pollSeconds}s | fails: ${config.farm.consecutiveFails} | cooldown: ${config.farm.cooldownSeconds}s`,
                     `autoRejoin: ${config.farm.autoRejoin?.enabled
