@@ -1,7 +1,495 @@
 import "dotenv/config";
-import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from "discord.js";
-import { execSync } from "child_process";
-import clipboard from "clipboardy";
+import dns from "node:dns";
+dns.setDefaultResultOrder("ipv4first");
+
+import { Client, GatewayIntentBits, WebhookClient } from "discord.js";
+import { execFile, spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
+import clipboard from 'clipboardy';
+import { promisify } from "node:util";
+
+const exec = promisify(execFile);
+
+const ROBLOX_PKG = process.env.ROBLOX_PKG || "com.roblox.client";
+const allowedUsers = new Set(
+    (process.env.ALLOWED_USERS || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+);
+
+function run(cmd, args) {
+    return new Promise((resolve, reject) => {
+        execFile(cmd, args, { windowsHide: true }, (err, stdout, stderr) => {
+            if (err) return reject(new Error((stderr || stdout || err.message).trim()));
+            resolve((stdout || stderr || "").trim());
+        });
+    });
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function isTcpSerial(serial) {
+    return /^[\d.]+:\d+$/.test(serial);
+}
+async function ensureAdbTcpConnected(serial) {
+    if (isTcpSerial(serial)) await run("adb", ["connect", serial]);
+}
+function sanitizeForAdbText(s) {
+    return s.replace(/ /g, "%s").replace(/[\r\n"'`]/g, "");
+}
+async function getAdbTargets() {
+    let out = "";
+    try {
+        out = await run("adb", ["devices"]);
+    } catch {
+        return [];
+    }
+    const lines = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const deviceLines = lines.slice(1);
+    const targets = [];
+    for (const line of deviceLines) {
+        const parts = line.split(/\s+/);
+        const serial = parts[0];
+        const state = parts[1] || "unknown";
+        if (serial) targets.push({ serial, state });
+    }
+    return targets;
+}
+
+const CONFIG_PATH = path.resolve("./config.json");
+
+const DEFAULT_CONFIG = {
+    devices: {
+        defaultCoords: { receiveX: 1072, receiveY: 463, keyX: 1068, keyY: 296, contX: 1065, contY: 382 },
+        coordsBySerial: {},
+        minimizeProcessNames: ["MuMuNxDevice", "MuMuVMMHeadless"],
+    },
+    farm: {
+        enabled: false,
+        placeId: 1537690962,
+        pollSeconds: 30,
+        consecutiveFails: 2,
+        cooldownSeconds: 600,
+        webhookUrl: "",
+        strictPlaceMatch: false,
+        autoRejoin: {
+            enabled: false,
+            retries: 2,
+            delayMs: 2500,
+            closeFirst: true,
+            useVip: false,
+        },
+        vipLink: "",
+        watch: [],
+    },
+};
+
+async function loadConfig() {
+    try {
+        const raw = await fs.readFile(CONFIG_PATH, "utf8");
+        const parsed = JSON.parse(raw);
+
+        return {
+            ...DEFAULT_CONFIG,
+            ...parsed,
+            devices: {
+                ...DEFAULT_CONFIG.devices,
+                ...(parsed.devices || {}),
+                coordsBySerial: parsed.devices?.coordsBySerial || {},
+                minimizeProcessNames: Array.isArray(parsed.devices?.minimizeProcessNames)
+                    ? parsed.devices.minimizeProcessNames
+                    : DEFAULT_CONFIG.devices.minimizeProcessNames,
+            },
+            farm: {
+                ...DEFAULT_CONFIG.farm,
+                ...(parsed.farm || {}),
+                autoRejoin: {
+                    ...DEFAULT_CONFIG.farm.autoRejoin,
+                    ...(parsed.farm?.autoRejoin || {}),
+                },
+                watch: Array.isArray(parsed.farm?.watch) ? parsed.farm.watch : [],
+            },
+        };
+    } catch {
+        return structuredClone(DEFAULT_CONFIG);
+    }
+}
+
+async function saveConfig(cfg) {
+    const tmp = CONFIG_PATH + ".tmp";
+    await fs.writeFile(tmp, JSON.stringify(cfg, null, 2), "utf8");
+    await fs.rename(tmp, CONFIG_PATH);
+}
+
+let config = await loadConfig();
+
+function coordsFor(serial) {
+    return config.devices.coordsBySerial?.[serial] || config.devices.defaultCoords;
+}
+
+async function tap(serial, x, y) {
+    await ensureAdbTcpConnected(serial);
+    await run("adb", ["-s", serial, "shell", "input", "tap", String(x), String(y)]);
+}
+async function keyevent(serial, code) {
+    await ensureAdbTcpConnected(serial);
+    await run("adb", ["-s", serial, "shell", "input", "keyevent", String(code)]);
+}
+async function typeText(serial, text) {
+    await ensureAdbTcpConnected(serial);
+    await run("adb", ["-s", serial, "shell", "input", "text", sanitizeForAdbText(text)]);
+}
+
+const publicDeepLink = (placeId) => `roblox://experiences/start?placeId=${placeId}`;
+
+function getVipAccessCode(link) {
+    if (!link) throw new Error("No VIP link set. Use /farm set-vip-link first.");
+    const match = link.match(/[?&]privateServerLinkCode=([^&]+)/);
+    if (!match) throw new Error("Invalid VIP link format.");
+    return match[1];
+}
+
+const vipDeepLink = (placeId, accessCode) => `roblox://experiences/start?placeId=${placeId}&accessCode=${accessCode}`;
+
+async function launchRoblox(serial) {
+    await ensureAdbTcpConnected(serial);
+    await run("adb", [
+        "-s", serial,
+        "shell", "monkey",
+        "-p", ROBLOX_PKG,
+        "-c", "android.intent.category.LAUNCHER",
+        "1",
+    ]);
+}
+
+async function joinBeeSwarm(serial, useVip = false) {
+    await ensureAdbTcpConnected(serial);
+
+    if (useVip) {
+        if (!config.farm.vipLink) throw new Error("No VIP link set. Use /farm set-vip-link first.");
+
+        await run("adb", [
+            "-s", serial,
+            "shell", "am", "start",
+            "-a", "android.intent.action.VIEW",
+            "-d", config.farm.vipLink.trim(),
+        ]);
+
+        await sleep(6000);
+
+        await run("adb", ["-s", serial, "shell", "am", "force-stop", "com.android.chrome"]).catch(() => { });
+        await run("adb", ["-s", serial, "shell", "am", "force-stop", "com.android.browser"]).catch(() => { });
+        await run("adb", ["-s", serial, "shell", "am", "force-stop", "org.chromium.webview_shell"]).catch(() => { });
+    } else {
+        const dl = publicDeepLink(config.farm.placeId);
+        await run("adb", [
+            "-s", serial,
+            "shell", "am", "start",
+            "-a", "android.intent.action.VIEW",
+            "-d", dl,
+        ]);
+    }
+}
+
+async function openAndJoinBeeSwarm(serial, useVip = false) {
+    await launchRoblox(serial);
+    await sleep(2000);
+    await joinBeeSwarm(serial, useVip);
+}
+
+async function restartRoblox(serial, useVip = false) {
+    await closeRoblox(serial);
+    await sleep(1000);
+    await openAndJoinBeeSwarm(serial, useVip);
+}
+
+async function closeRoblox(serial) {
+    await ensureAdbTcpConnected(serial);
+    await run("adb", ["-s", serial, "shell", "am", "force-stop", ROBLOX_PKG]);
+}
+
+async function pressReceiveKeyThenBack(serial) {
+    const c = coordsFor(serial);
+
+    await tap(serial, c.receiveX, c.receiveY);
+    await sleep(700);
+
+    await keyevent(serial, 4);
+    await sleep(250);
+    await keyevent(serial, 4);
+
+    await run("adb", ["-s", serial, "shell", "am", "force-stop", "com.android.browser"]).catch(() => { });
+}
+
+async function enterKeyAndContinue(serial, key) {
+    const c = coordsFor(serial);
+
+    await tap(serial, c.keyX, c.keyY);
+    await sleep(150);
+    await typeText(serial, key);
+    await sleep(150);
+    await tap(serial, c.contX, c.contY);
+}
+
+async function minimizeInstancesWindows() {
+    if (process.platform !== "win32") {
+        throw new Error("minimize-instances is implemented for Windows only.");
+    }
+
+    const names = (config.devices.minimizeProcessNames || [])
+        .map((s) => String(s).trim())
+        .filter(Boolean);
+
+    if (names.length === 0) {
+        throw new Error("No minimize process names set. Use config.json devices.minimizeProcessNames");
+    }
+
+    const namesArray = names.map((n) => `"${n}"`).join(",");
+
+    const ps = `
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32 {
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+}
+"@;
+
+$names = @(${namesArray});
+
+Get-Process | Where-Object { $names -contains $_.Name } | ForEach-Object {
+  if ($_.MainWindowHandle -ne 0) {
+    [Win32]::ShowWindowAsync($_.MainWindowHandle, 6) | Out-Null
+  }
+}
+  `.trim();
+
+    await run("powershell", ["-NoProfile", "-Command", ps]);
+}
+
+function makeWebhookClient(url) {
+    return url ? new WebhookClient({ url }) : null;
+}
+
+async function postJson(url, body, timeoutMs = 12000) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "accept": "application/json" },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+        });
+        const text = await res.text().catch(() => "");
+        if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} :: ${text.slice(0, 200)}`);
+        return text ? JSON.parse(text) : null;
+    } finally {
+        clearTimeout(t);
+    }
+}
+
+async function robloxUsernamesToIds(usernames) {
+    const json = await postJson("https://users.roblox.com/v1/usernames/users", {
+        usernames,
+        excludeBannedUsers: false,
+    });
+    const map = new Map();
+    for (const item of (json?.data || [])) {
+        if (item?.name && typeof item?.id === "number") {
+            map.set(String(item.name).toLowerCase(), item.id);
+        }
+    }
+    return map;
+}
+
+async function robloxGetPresences(userIds) {
+    const json = await postJson("https://presence.roblox.com/v1/presence/users", { userIds });
+    return json?.userPresences || [];
+}
+
+function presenceType(p) {
+    return p?.userPresenceType ?? p?.PresenceType ?? -1;
+}
+function getPlaceId(p) {
+    return p?.placeId ?? p?.PlaceId ?? null;
+}
+function getRootPlaceId(p) {
+    return p?.rootPlaceId ?? p?.RootPlaceId ?? null;
+}
+function getLastLocation(p) {
+    return String(p?.lastLocation ?? p?.LastLocation ?? "");
+}
+
+function isFarmingPresence(p, cfg) {
+    const inGame = presenceType(p) === 2;
+    if (!inGame) return false;
+
+    const placeId = getPlaceId(p);
+    const rootPlaceId = getRootPlaceId(p);
+    const lastLoc = getLastLocation(p).toLowerCase();
+
+    if (cfg.strictPlaceMatch) {
+        if (placeId == cfg.placeId || rootPlaceId == cfg.placeId) return true;
+        if (lastLoc.includes("bee swarm")) return true;
+        return false;
+    }
+
+    if (placeId || rootPlaceId) return (placeId == cfg.placeId || rootPlaceId == cfg.placeId);
+    if (lastLoc) return lastLoc.includes("bee swarm");
+    return true;
+}
+
+function prettyPresence(p) {
+    const t = presenceType(p);
+    const typeStr =
+        t === 0 ? "Offline" :
+            t === 1 ? "Online" :
+                t === 2 ? "In Game" :
+                    t === 3 ? "In Studio" :
+                        `Unknown(${t})`;
+
+    const placeId = getPlaceId(p);
+    const rootPlaceId = getRootPlaceId(p);
+    const lastLoc = getLastLocation(p);
+
+    return `${typeStr}` +
+        (placeId ? ` | placeId=${placeId}` : "") +
+        (rootPlaceId ? ` | rootPlaceId=${rootPlaceId}` : "") +
+        (lastLoc ? ` | ${lastLoc}` : "");
+}
+
+async function farmSend(msg) {
+    const hook = makeWebhookClient(config.farm.webhookUrl);
+    if (!hook) return;
+    await hook.send({ content: msg });
+}
+
+const farmState = new Map();
+
+async function tryAutoRejoinPublic(w, p, useVip = false) {
+    const ar = config.farm.autoRejoin || {};
+    if (!ar.enabled) return "autoRejoin disabled";
+    if (!w.targetSerial) return "no device mapped";
+    if (presenceType(p) === 2) return "skipped (Roblox still in-game per presence)";
+
+    const retries = Math.max(0, Number(ar.retries ?? 2));
+    const delayMs = Math.max(500, Number(ar.delayMs ?? 2500));
+    const closeFirst = ar.closeFirst !== false;
+    useVip = useVip || ar.useVip;
+
+    let lastErr = null;
+    for (let i = 0; i <= retries; i++) {
+        try {
+            if (closeFirst) {
+                await closeRoblox(w.targetSerial).catch(() => { });
+                await sleep(800);
+            }
+            await openAndJoinBeeSwarm(w.targetSerial, useVip);
+            return `rejoin attempted (try ${i + 1}/${retries + 1})`;
+        } catch (e) {
+            lastErr = e;
+            await sleep(delayMs);
+        }
+    }
+    return `rejoin failed: ${lastErr?.message || "unknown error"}`;
+}
+
+async function farmPollOnce() {
+    if (!config.farm.enabled) return;
+    if (!config.farm.webhookUrl) return;
+    if (!Array.isArray(config.farm.watch) || config.farm.watch.length === 0) return;
+
+    const watched = config.farm.watch.filter(w => typeof w.userId === "number");
+    if (watched.length === 0) return;
+
+    const ids = watched.map(w => w.userId);
+
+    const presences = [];
+    for (let i = 0; i < ids.length; i += 50) {
+        const chunk = ids.slice(i, i + 50);
+        const p = await robloxGetPresences(chunk);
+        presences.push(...p);
+    }
+
+    const byId = new Map();
+    for (const p of presences) {
+        if (typeof p?.userId === "number") byId.set(p.userId, p);
+    }
+
+    const nowMs = Date.now();
+    const cooldownMs = Math.max(30, Number(config.farm.cooldownSeconds || 600)) * 1000;
+    const failN = Math.max(1, Number(config.farm.consecutiveFails || 2));
+
+    for (const w of watched) {
+        let p = byId.get(w.userId);
+        if (!p) p = { userId: w.userId, userPresenceType: 0, lastLocation: "" };
+
+        const farmingNow = isFarmingPresence(p, config.farm);
+
+        const prev = farmState.get(w.userId) || {
+            lastWasFarming: false,
+            everFarming: false,
+            badCount: 0,
+            lastAlertAtMs: 0,
+            lastPresenceText: "",
+        };
+
+        const everFarming = prev.everFarming || farmingNow;
+        const badCount = farmingNow ? 0 : (prev.badCount + 1);
+
+        const shouldAlert =
+            farmingNow === false &&
+            badCount >= failN &&
+            (nowMs - prev.lastAlertAtMs) >= cooldownMs;
+
+        if (shouldAlert) {
+            const rejoinNote = await tryAutoRejoinPublic(w, p);
+
+            const device = w.targetSerial ? ` (device: **${w.targetSerial}**)` : "";
+            const note = everFarming ? "" : "\nNOTE: monitor has not seen this account farming since start.";
+            await farmSend(
+                `**Not farming / disconnected**\n` +
+                `User: **${w.usernameLower}**${device}\n` +
+                `Now: ${prettyPresence(p)}\n` +
+                `Expected placeId: ${config.farm.placeId}\n` +
+                `bad=${badCount} (threshold=${failN})\n` +
+                `${rejoinNote}` +
+                `${note}\n` +
+                `Time: <t:${Math.floor(nowMs / 1000)}:F>`
+            );
+
+            prev.lastAlertAtMs = nowMs;
+        }
+
+        farmState.set(w.userId, {
+            lastWasFarming: farmingNow,
+            everFarming,
+            badCount,
+            lastAlertAtMs: prev.lastAlertAtMs,
+            lastPresenceText: prettyPresence(p),
+        });
+    }
+}
+
+let monitorLoopRunning = false;
+async function startMonitorLoop() {
+    if (monitorLoopRunning) return;
+    monitorLoopRunning = true;
+
+    while (monitorLoopRunning) {
+        try {
+            await farmPollOnce();
+        } catch (e) {
+            console.log("Farm monitor error:", e?.message || e);
+            if (e?.stack) console.log(e.stack);
+        }
+
+        const ms = Math.max(10, Number(config.farm.pollSeconds || 30)) * 1000;
+        await sleep(ms);
+    }
+}
 
 const client = new Client({
     intents: [GatewayIntentBits.Guilds],
