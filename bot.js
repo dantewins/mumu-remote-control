@@ -249,7 +249,7 @@ client.on("interactionCreate", async (interaction) => {
                 });
 
             } catch (error) {
-                await interaction.editReply('Failed to read clipboard.');
+                await interaction.editReply('Failed to read clipboard. (Install package clipboardy)');
             }
         }
 
