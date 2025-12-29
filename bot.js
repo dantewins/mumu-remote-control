@@ -163,37 +163,43 @@ async function launchRoblox(serial) {
 }
 
 async function joinBeeSwarm(serial, useVip = false) {
-    await ensureAdbTcpConnected(serial);
-    let dl;
-    if (useVip) {
-        const code = getVipAccessCode(config.farm.vipLink);
-        dl = vipDeepLink(config.farm.placeId, code);
-    } else {
-        dl = publicDeepLink(config.farm.placeId);
-    }
+  await ensureAdbTcpConnected(serial);
+
+  if (useVip) {
+    if (!config.farm.vipLink) throw new Error("No VIP link set. Use /farm set-vip-link first.");
+
     await run("adb", [
-        "-s", serial,
-        "shell", "am", "start",
-        "-a", "android.intent.action.VIEW",
-        "-d", dl,
+      "-s", serial,
+      "shell", "am", "start",
+      "-a", "android.intent.action.VIEW",
+      "-d", config.farm.vipLink.trim(),
     ]);
+  } else {
+    const dl = publicDeepLink(config.farm.placeId);
+    await run("adb", [
+      "-s", serial,
+      "shell", "am", "start",
+      "-a", "android.intent.action.VIEW",
+      "-d", dl,
+    ]);
+  }
+}
+
+async function openAndJoinBeeSwarm(serial, useVip = false) {
+  await launchRoblox(serial);
+  await sleep(2000);
+  await joinBeeSwarm(serial, useVip);
+}
+
+async function restartRoblox(serial, useVip = false) {
+  await closeRoblox(serial);
+  await sleep(1000);
+  await openAndJoinBeeSwarm(serial, useVip);
 }
 
 async function closeRoblox(serial) {
     await ensureAdbTcpConnected(serial);
     await run("adb", ["-s", serial, "shell", "am", "force-stop", ROBLOX_PKG]);
-}
-
-async function openAndJoinBeeSwarm(serial, useVip = false) {
-    await launchRoblox(serial);
-    await sleep(2000);
-    await joinBeeSwarm(serial, useVip);
-}
-
-async function restartRoblox(serial, useVip = false) {
-    await closeRoblox(serial);
-    await sleep(800);
-    await openAndJoinBeeSwarm(serial, useVip);
 }
 
 async function pressReceiveKeyThenBack(serial) {
