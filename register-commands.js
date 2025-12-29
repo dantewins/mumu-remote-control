@@ -11,7 +11,8 @@ const commands = [
     new SlashCommandBuilder()
         .setName("roblox-open")
         .setDescription("Open Roblox and join Bee Swarm")
-        .addStringOption(targetRequired),
+        .addStringOption(targetRequired)
+        .addBooleanOption((o) => o.setName("vip").setDescription("Join VIP server if set (default: public)").setRequired(false)),
 
     new SlashCommandBuilder()
         .setName("roblox-close")
@@ -100,6 +101,20 @@ const commands = [
                 .addIntegerOption((o) => o.setName("retries").setDescription("How many retries (optional)").setRequired(false))
                 .addIntegerOption((o) => o.setName("delay_ms").setDescription("Delay between retries (ms, optional)").setRequired(false))
                 .addBooleanOption((o) => o.setName("close_first").setDescription("Force close Roblox before rejoin (optional)").setRequired(false))
+                .addBooleanOption((o) => o.setName("use_vip").setDescription("Use VIP server for auto-rejoin if set (optional)").setRequired(false))
+        )
+        .addSubcommand((sc) =>
+            sc
+                .setName("set-vip-link")
+                .setDescription("Set VIP server link for private joins")
+                .addStringOption((o) => o.setName("link").setDescription("Full VIP server link").setRequired(true))
+        )
+        .addSubcommand((sc) =>
+            sc
+                .setName("restart")
+                .setDescription("Force restart/rejoin on device")
+                .addStringOption(targetRequired)
+                .addBooleanOption((o) => o.setName("vip").setDescription("Join VIP server if set (default: public)").setRequired(false))
         )
         .addSubcommand((sc) => sc.setName("start").setDescription("Start monitoring"))
         .addSubcommand((sc) => sc.setName("stop").setDescription("Stop monitoring"))

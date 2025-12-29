@@ -77,7 +77,9 @@ const DEFAULT_CONFIG = {
             retries: 2,
             delayMs: 2500,
             closeFirst: true,
+            useVip: false,
         },
+        vipLink: "",
         watch: [],
     },
 };
@@ -138,7 +140,16 @@ async function typeText(serial, text) {
     await run("adb", ["-s", serial, "shell", "input", "text", sanitizeForAdbText(text)]);
 }
 
-const deepLink = (placeId) => `roblox://experiences/start?placeId=${placeId}`;
+const publicDeepLink = (placeId) => `roblox://experiences/start?placeId=${placeId}`;
+
+function getVipAccessCode(link) {
+    if (!link) throw new Error("No VIP link set. Use /farm set-vip-link first.");
+    const match = link.match(/[?&]privateServerLinkCode=([^&]+)/);
+    if (!match) throw new Error("Invalid VIP link format.");
+    return match[1];
+}
+
+const vipDeepLink = (placeId, accessCode) => `roblox://experiences/start?placeId=${placeId}&accessCode=${accessCode}`;
 
 async function launchRoblox(serial) {
     await ensureAdbTcpConnected(serial);
@@ -151,13 +162,20 @@ async function launchRoblox(serial) {
     ]);
 }
 
-async function joinBeeSwarm(serial) {
+async function joinBeeSwarm(serial, useVip = false) {
     await ensureAdbTcpConnected(serial);
+    let dl;
+    if (useVip) {
+        const code = getVipAccessCode(config.farm.vipLink);
+        dl = vipDeepLink(config.farm.placeId, code);
+    } else {
+        dl = publicDeepLink(config.farm.placeId);
+    }
     await run("adb", [
         "-s", serial,
         "shell", "am", "start",
         "-a", "android.intent.action.VIEW",
-        "-d", deepLink(config.farm.placeId),
+        "-d", dl,
     ]);
 }
 
@@ -166,10 +184,16 @@ async function closeRoblox(serial) {
     await run("adb", ["-s", serial, "shell", "am", "force-stop", ROBLOX_PKG]);
 }
 
-async function openAndJoinBeeSwarm(serial) {
+async function openAndJoinBeeSwarm(serial, useVip = false) {
     await launchRoblox(serial);
     await sleep(2000);
-    await joinBeeSwarm(serial);
+    await joinBeeSwarm(serial, useVip);
+}
+
+async function restartRoblox(serial, useVip = false) {
+    await closeRoblox(serial);
+    await sleep(800);
+    await openAndJoinBeeSwarm(serial, useVip);
 }
 
 async function pressReceiveKeyThenBack(serial) {
@@ -331,7 +355,7 @@ async function farmSend(msg) {
 
 const farmState = new Map();
 
-async function tryAutoRejoinPublic(w, p) {
+async function tryAutoRejoinPublic(w, p, useVip = false) {
     const ar = config.farm.autoRejoin || {};
     if (!ar.enabled) return "autoRejoin disabled";
     if (!w.targetSerial) return "no device mapped";
@@ -340,6 +364,7 @@ async function tryAutoRejoinPublic(w, p) {
     const retries = Math.max(0, Number(ar.retries ?? 2));
     const delayMs = Math.max(500, Number(ar.delayMs ?? 2500));
     const closeFirst = ar.closeFirst !== false;
+    useVip = useVip || ar.useVip;
 
     let lastErr = null;
     for (let i = 0; i <= retries; i++) {
@@ -348,7 +373,7 @@ async function tryAutoRejoinPublic(w, p) {
                 await closeRoblox(w.targetSerial).catch(() => { });
                 await sleep(800);
             }
-            await openAndJoinBeeSwarm(w.targetSerial);
+            await openAndJoinBeeSwarm(w.targetSerial, useVip);
             return `rejoin attempted (try ${i + 1}/${retries + 1})`;
         } catch (e) {
             lastErr = e;
@@ -523,8 +548,9 @@ client.on("interactionCreate", async (interaction) => {
 
         if (interaction.commandName === "roblox-open") {
             const target = interaction.options.getString("target", true);
-            await openAndJoinBeeSwarm(target);
-            await interaction.editReply(`Opened Roblox + joined Bee Swarm on **${target}**`);
+            const useVip = interaction.options.getBoolean("vip", false) ?? false;
+            await openAndJoinBeeSwarm(target, useVip);
+            await interaction.editReply(`Opened Roblox + joined Bee Swarm on **${target}** (VIP: ${useVip})`);
             return;
         }
 
@@ -554,6 +580,14 @@ client.on("interactionCreate", async (interaction) => {
 
         if (interaction.commandName === "farm") {
             const sub = interaction.options.getSubcommand();
+
+            if (sub === "set-vip-link") {
+                const link = interaction.options.getString("link", true).trim();
+                config.farm.vipLink = link;
+                await saveConfig(config);
+                await interaction.editReply(`VIP link set to ${link}`);
+                return;
+            }
 
             if (sub === "set-place") {
                 config.farm.placeId = interaction.options.getInteger("place_id", true);
@@ -602,19 +636,29 @@ client.on("interactionCreate", async (interaction) => {
                 const retries = interaction.options.getInteger("retries", false);
                 const delayMs = interaction.options.getInteger("delay_ms", false);
                 const closeFirst = interaction.options.getBoolean("close_first", false);
+                const useVip = interaction.options.getBoolean("use_vip", false);
 
                 config.farm.autoRejoin = config.farm.autoRejoin || structuredClone(DEFAULT_CONFIG.farm.autoRejoin);
                 config.farm.autoRejoin.enabled = enabled;
                 if (retries !== null && retries !== undefined) config.farm.autoRejoin.retries = Math.max(0, retries);
                 if (delayMs !== null && delayMs !== undefined) config.farm.autoRejoin.delayMs = Math.max(500, delayMs);
                 if (closeFirst !== null && closeFirst !== undefined) config.farm.autoRejoin.closeFirst = !!closeFirst;
+                if (useVip !== null && useVip !== undefined) config.farm.autoRejoin.useVip = !!useVip;
 
                 await saveConfig(config);
 
                 await interaction.editReply(
                     `Auto rejoin updated\n` +
-                    `enabled=${config.farm.autoRejoin.enabled} retries=${config.farm.autoRejoin.retries} delayMs=${config.farm.autoRejoin.delayMs} closeFirst=${config.farm.autoRejoin.closeFirst}`
+                    `enabled=${config.farm.autoRejoin.enabled} retries=${config.farm.autoRejoin.retries} delayMs=${config.farm.autoRejoin.delayMs} closeFirst=${config.farm.autoRejoin.closeFirst} useVip=${config.farm.autoRejoin.useVip}`
                 );
+                return;
+            }
+
+            if (sub === "restart") {
+                const target = interaction.options.getString("target", true);
+                const useVip = interaction.options.getBoolean("vip", false) ?? false;
+                await restartRoblox(target, useVip);
+                await interaction.editReply(`Restarted Roblox on **${target}** (VIP: ${useVip})`);
                 return;
             }
 
@@ -688,6 +732,7 @@ client.on("interactionCreate", async (interaction) => {
                     `poll: ${config.farm.pollSeconds}s | fails: ${config.farm.consecutiveFails} | cooldown: ${config.farm.cooldownSeconds}s`,
                     `autoRejoin: ${config.farm.autoRejoin?.enabled ? `on (retries=${config.farm.autoRejoin.retries}, delayMs=${config.farm.autoRejoin.delayMs})` : "off"}`,
                     `webhook: ${config.farm.webhookUrl ? "set" : "not set"}`,
+                    `vipLink: ${config.farm.vipLink ? "set" : "not set"}`,
                     `watching: ${config.farm.watch.length}`,
                     "",
                 ];
