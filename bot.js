@@ -6,6 +6,7 @@ import { Client, GatewayIntentBits, WebhookClient } from "discord.js";
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import clipboard from 'clipboardy';
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -573,13 +574,28 @@ client.on("interactionCreate", async (interaction) => {
             return;
         }
 
-        if (interaction.commandName === "receive-key") {
-            const target = interaction.options.getString("target", true);
-            await pressReceiveKeyThenBack(target);
-            await interaction.editReply(
-                `Tapped **Receive Key** and returned to Roblox on **${target}**\nNow open the copied link on your PC, get the key, then run /enter-key.`
-            );
-            return;
+        if (commandName === 'receive-key') {
+            const target = interaction.options.getString('target');
+
+            await interaction.deferReply({ ephemeral: true });
+
+            try {
+                const key = await clipboard.read();
+
+                if (!key || key.trim() === '') {
+                    await interaction.editReply('Clipboard is empty.');
+                    return;
+                }
+
+                const trimmedKey = key.trim();
+
+                await interaction.editReply({
+                    content: `Key received:\n\`\`\`\n${trimmedKey}\n\`\`\``,
+                });
+
+            } catch (error) {
+                await interaction.editReply('Failed to read clipboard.');
+            }
         }
 
         if (interaction.commandName === "enter-key") {
