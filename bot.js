@@ -8,6 +8,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import clipboard from 'clipboardy';
 import { promisify } from "node:util";
+import { REST, Routes, SlashCommandBuilder } from "discord.js";
 
 const exec = promisify(execFile);
 
@@ -615,7 +616,7 @@ const commands = [
         .addSubcommand((sc) => sc.setName("status").setDescription("Show current monitor status")),
 ].map((c) => c.toJSON());
 
-client.once("ready", async () => {
+client.once("clientReady", async () => {
     console.log(`Logged in as ${client.user.tag}`);
 
     try {
@@ -662,6 +663,8 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     await interaction.deferReply({ ephemeral: true });
+
+    const commandName = interaction.commandName;
 
     try {
         if (commandName === 'update-bot') {
