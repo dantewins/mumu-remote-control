@@ -509,6 +509,12 @@ client.on("interactionCreate", async (interaction) => {
     await interaction.deferReply({ ephemeral: true });
 
     try {
+        if (interaction.commandName === "update-bot") {
+            const result = await updateBot();
+            await interaction.editReply(result);
+            return;
+        }
+
         if (interaction.commandName === "minimize-instances") {
             await minimizeInstancesWindows();
             await interaction.editReply("Minimized emulator instances");
@@ -609,12 +615,6 @@ client.on("interactionCreate", async (interaction) => {
                     `Auto rejoin updated\n` +
                     `enabled=${config.farm.autoRejoin.enabled} retries=${config.farm.autoRejoin.retries} delayMs=${config.farm.autoRejoin.delayMs} closeFirst=${config.farm.autoRejoin.closeFirst}`
                 );
-                return;
-            }
-
-            if (sub === "update") {
-                const result = await updateBot();
-                await interaction.editReply(result);
                 return;
             }
 
