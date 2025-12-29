@@ -7,12 +7,6 @@ const targetRequired = (o) =>
         .setRequired(true)
         .setAutocomplete(true);
 
-const targetOptional = (o) =>
-    o.setName("target")
-        .setDescription("ADB device serial (type to autocomplete)")
-        .setRequired(false)
-        .setAutocomplete(true);
-
 const commands = [
     new SlashCommandBuilder()
         .setName("roblox-open")
@@ -42,57 +36,8 @@ const commands = [
         .setDescription("Minimize emulator instances (Windows)"),
 
     new SlashCommandBuilder()
-        .setName("device")
-        .setDescription("Device utilities")
-        .addSubcommand((sc) =>
-            sc.setName("list").setDescription("List ADB devices currently detected")
-        )
-        .addSubcommand((sc) =>
-            sc
-                .setName("coords-show")
-                .setDescription("Show coords for a device (or default)")
-                .addStringOption(targetRequired)
-        )
-        .addSubcommand((sc) =>
-            sc
-                .setName("coords-clear")
-                .setDescription("Clear custom coords override for this device (fallback to default)")
-                .addStringOption(targetRequired)
-        )
-        .addSubcommand((sc) =>
-            sc
-                .setName("coords-default")
-                .setDescription("Set DEFAULT coords used for any device without overrides")
-                .addIntegerOption((o) => o.setName("receive_x").setDescription("Receive Key X").setRequired(true))
-                .addIntegerOption((o) => o.setName("receive_y").setDescription("Receive Key Y").setRequired(true))
-                .addIntegerOption((o) => o.setName("key_x").setDescription("Key box X").setRequired(true))
-                .addIntegerOption((o) => o.setName("key_y").setDescription("Key box Y").setRequired(true))
-                .addIntegerOption((o) => o.setName("cont_x").setDescription("Continue X").setRequired(true))
-                .addIntegerOption((o) => o.setName("cont_y").setDescription("Continue Y").setRequired(true))
-        )
-        .addSubcommand((sc) =>
-            sc
-                .setName("coords-set")
-                .setDescription("Set coords override for a specific device serial")
-                .addStringOption(targetRequired)
-                .addIntegerOption((o) => o.setName("receive_x").setDescription("Receive Key X").setRequired(true))
-                .addIntegerOption((o) => o.setName("receive_y").setDescription("Receive Key Y").setRequired(true))
-                .addIntegerOption((o) => o.setName("key_x").setDescription("Key box X").setRequired(true))
-                .addIntegerOption((o) => o.setName("key_y").setDescription("Key box Y").setRequired(true))
-                .addIntegerOption((o) => o.setName("cont_x").setDescription("Continue X").setRequired(true))
-                .addIntegerOption((o) => o.setName("cont_y").setDescription("Continue Y").setRequired(true))
-        )
-        .addSubcommand((sc) =>
-            sc
-                .setName("minimize-set")
-                .setDescription("Set Windows process names to minimize (comma-separated)")
-                .addStringOption((o) =>
-                    o.setName("names").setDescription("Example: MuMuNxDevice,MuMuVMMHeadless").setRequired(true)
-                )
-        )
-        .addSubcommand((sc) =>
-            sc.setName("minimize-show").setDescription("Show current minimize process names")
-        ),
+        .setName("update-bot")
+        .setDescription("Update bot from GitHub if new commits available"),
 
     new SlashCommandBuilder()
         .setName("farm")
@@ -102,7 +47,12 @@ const commands = [
                 .setName("add")
                 .setDescription("Add a Roblox username to monitor")
                 .addStringOption((o) => o.setName("username").setDescription("Roblox username").setRequired(true))
-                .addStringOption(targetOptional)
+                .addStringOption((o) =>
+                    o.setName("target")
+                        .setDescription("ADB device serial to map this account to (autocomplete)")
+                        .setRequired(false)
+                        .setAutocomplete(true)
+                )
         )
         .addSubcommand((sc) =>
             sc
@@ -124,7 +74,6 @@ const commands = [
                 .addStringOption((o) => o.setName("url").setDescription("Discord webhook URL").setRequired(true))
         )
         .addSubcommand((sc) => sc.setName("clear-webhook").setDescription("Clear webhook URL"))
-        .addSubcommand((sc) => sc.setName("test-webhook").setDescription("Send a test webhook message"))
         .addSubcommand((sc) =>
             sc
                 .setName("set-poll")
@@ -145,26 +94,16 @@ const commands = [
         )
         .addSubcommand((sc) =>
             sc
-                .setName("set-strict")
-                .setDescription("Strict mode: require matching placeId (can cause false negatives)")
-                .addBooleanOption((o) => o.setName("enabled").setDescription("true/false").setRequired(true))
-        )
-        .addSubcommand((sc) =>
-            sc
-                .setName("set-cookie")
-                .setDescription("Set Roblox .ROBLOSECURITY cookie for API auth")
-                .addStringOption((o) => o.setName("cookie").setDescription("The cookie value").setRequired(true))
-        )
-        .addSubcommand((sc) => sc.setName("clear-cookie").setDescription("Clear Roblox cookie"))
-        .addSubcommand((sc) =>
-            sc
-                .setName("set-autorestart")
-                .setDescription("Enable auto-restart of Roblox on device when not farming detected")
-                .addBooleanOption((o) => o.setName("enabled").setDescription("true/false").setRequired(true))
+                .setName("set-rejoin")
+                .setDescription("Auto rejoin Bee Swarm (public) when disconnected")
+                .addBooleanOption((o) => o.setName("enabled").setDescription("Enable auto rejoin").setRequired(true))
+                .addIntegerOption((o) => o.setName("retries").setDescription("How many retries (optional)").setRequired(false))
+                .addIntegerOption((o) => o.setName("delay_ms").setDescription("Delay between retries (ms, optional)").setRequired(false))
+                .addBooleanOption((o) => o.setName("close_first").setDescription("Force close Roblox before rejoin (optional)").setRequired(false))
         )
         .addSubcommand((sc) => sc.setName("start").setDescription("Start monitoring"))
         .addSubcommand((sc) => sc.setName("stop").setDescription("Stop monitoring"))
-        .addSubcommand((sc) => sc.setName("status").setDescription("Show monitor status")),
+        .addSubcommand((sc) => sc.setName("status").setDescription("Show current monitor status")),
 ].map((c) => c.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
@@ -174,4 +113,4 @@ await rest.put(
     { body: commands }
 );
 
-console.log("✅ Registered slash commands.");
+console.log("Registered slash commands.");

@@ -1,8 +1,14 @@
 import "dotenv/config";
+import dns from "node:dns";
+dns.setDefaultResultOrder("ipv4first");
+
 import { Client, GatewayIntentBits, WebhookClient } from "discord.js";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
+
+const exec = promisify(execFile);
 
 const ROBLOX_PKG = process.env.ROBLOX_PKG || "com.roblox.client";
 const allowedUsers = new Set(
@@ -28,11 +34,9 @@ function isTcpSerial(serial) {
 async function ensureAdbTcpConnected(serial) {
     if (isTcpSerial(serial)) await run("adb", ["connect", serial]);
 }
-
 function sanitizeForAdbText(s) {
     return s.replace(/ /g, "%s").replace(/[\r\n"'`]/g, "");
 }
-
 async function getAdbTargets() {
     let out = "";
     try {
@@ -68,9 +72,13 @@ const DEFAULT_CONFIG = {
         cooldownSeconds: 600,
         webhookUrl: "",
         strictPlaceMatch: false,
+        autoRejoin: {
+            enabled: false,
+            retries: 2,
+            delayMs: 2500,
+            closeFirst: true,
+        },
         watch: [],
-        robloxCookie: "",
-        autoRestart: false,
     },
 };
 
@@ -93,6 +101,10 @@ async function loadConfig() {
             farm: {
                 ...DEFAULT_CONFIG.farm,
                 ...(parsed.farm || {}),
+                autoRejoin: {
+                    ...DEFAULT_CONFIG.farm.autoRejoin,
+                    ...(parsed.farm?.autoRejoin || {}),
+                },
                 watch: Array.isArray(parsed.farm?.watch) ? parsed.farm.watch : [],
             },
         };
@@ -154,6 +166,12 @@ async function closeRoblox(serial) {
     await run("adb", ["-s", serial, "shell", "am", "force-stop", ROBLOX_PKG]);
 }
 
+async function openAndJoinBeeSwarm(serial) {
+    await launchRoblox(serial);
+    await sleep(2000);
+    await joinBeeSwarm(serial);
+}
+
 async function pressReceiveKeyThenBack(serial) {
     const c = coordsFor(serial);
 
@@ -187,7 +205,7 @@ async function minimizeInstancesWindows() {
         .filter(Boolean);
 
     if (names.length === 0) {
-        throw new Error("No minimize process names set. Use /device minimize-set");
+        throw new Error("No minimize process names set. Use config.json devices.minimizeProcessNames");
     }
 
     const namesArray = names.map((n) => `"${n}"`).join(",");
@@ -203,12 +221,12 @@ public class Win32 {
 
 $names = @(${namesArray});
 
-Get-Process | Where-Object { $names -contains $_.Name.ToLower() } | ForEach-Object {
+Get-Process | Where-Object { $names -contains $_.Name } | ForEach-Object {
   if ($_.MainWindowHandle -ne 0) {
     [Win32]::ShowWindowAsync($_.MainWindowHandle, 6) | Out-Null
   }
 }
-`;
+  `.trim();
 
     await run("powershell", ["-NoProfile", "-Command", ps]);
 }
@@ -217,25 +235,22 @@ function makeWebhookClient(url) {
     return url ? new WebhookClient({ url }) : null;
 }
 
-function getRobloxHeaders() {
-    const headers = { "content-type": "application/json", "accept": "application/json" };
-    if (config.farm.robloxCookie) {
-        headers["Cookie"] = `.ROBLOSECURITY=${config.farm.robloxCookie}`;
-    }
-    return headers;
-}
-
-async function postJson(url, body) {
-    const res = await fetch(url, {
-        method: "POST",
-        headers: getRobloxHeaders(),
-        body: JSON.stringify(body),
-    });
-    if (!res.ok) {
+async function postJson(url, body, timeoutMs = 12000) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "accept": "application/json" },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+        });
         const text = await res.text().catch(() => "");
-        throw new Error(`HTTP ${res.status} ${text.slice(0, 200)}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} :: ${text.slice(0, 200)}`);
+        return text ? JSON.parse(text) : null;
+    } finally {
+        clearTimeout(t);
     }
-    return res.json();
 }
 
 async function robloxUsernamesToIds(usernames) {
@@ -257,26 +272,15 @@ async function robloxGetPresences(userIds) {
     return json?.userPresences || [];
 }
 
-async function robloxLegacyOnlineStatus(userId) {
-    const res = await fetch(`https://api.roblox.com/users/${userId}/onlinestatus`, {
-        headers: { ...getRobloxHeaders(), "accept": "application/json" },
-    });
-    if (!res.ok) return null;
-    return res.json().catch(() => null);
-}
-
 function presenceType(p) {
     return p?.userPresenceType ?? p?.PresenceType ?? -1;
 }
-
 function getPlaceId(p) {
     return p?.placeId ?? p?.PlaceId ?? null;
 }
-
 function getRootPlaceId(p) {
     return p?.rootPlaceId ?? p?.RootPlaceId ?? null;
 }
-
 function getLastLocation(p) {
     return String(p?.lastLocation ?? p?.LastLocation ?? "");
 }
@@ -288,7 +292,6 @@ function isFarmingPresence(p, cfg) {
     const placeId = getPlaceId(p);
     const rootPlaceId = getRootPlaceId(p);
     const lastLoc = getLastLocation(p).toLowerCase();
-    const hasAnyDetails = !!(placeId || rootPlaceId || lastLoc);
 
     if (cfg.strictPlaceMatch) {
         if (placeId == cfg.placeId || rootPlaceId == cfg.placeId) return true;
@@ -296,18 +299,9 @@ function isFarmingPresence(p, cfg) {
         return false;
     }
 
-    if (placeId || rootPlaceId) {
-        if (placeId == cfg.placeId || rootPlaceId == cfg.placeId) return true;
-        return false;
-    }
-    if (lastLoc) {
-        if (lastLoc.includes("bee swarm")) return true;
-        return false;
-    }
-
-    if (inGame && !hasAnyDetails) return true;
-
-    return false;
+    if (placeId || rootPlaceId) return (placeId == cfg.placeId || rootPlaceId == cfg.placeId);
+    if (lastLoc) return lastLoc.includes("bee swarm");
+    return true;
 }
 
 function prettyPresence(p) {
@@ -329,12 +323,39 @@ function prettyPresence(p) {
         (lastLoc ? ` | ${lastLoc}` : "");
 }
 
-const farmState = new Map();
-
 async function farmSend(msg) {
     const hook = makeWebhookClient(config.farm.webhookUrl);
     if (!hook) return;
     await hook.send({ content: msg });
+}
+
+const farmState = new Map();
+
+async function tryAutoRejoinPublic(w, p) {
+    const ar = config.farm.autoRejoin || {};
+    if (!ar.enabled) return "autoRejoin disabled";
+    if (!w.targetSerial) return "no device mapped";
+    if (presenceType(p) === 2) return "skipped (Roblox still in-game per presence)";
+
+    const retries = Math.max(0, Number(ar.retries ?? 2));
+    const delayMs = Math.max(500, Number(ar.delayMs ?? 2500));
+    const closeFirst = ar.closeFirst !== false;
+
+    let lastErr = null;
+    for (let i = 0; i <= retries; i++) {
+        try {
+            if (closeFirst) {
+                await closeRoblox(w.targetSerial).catch(() => { });
+                await sleep(800);
+            }
+            await openAndJoinBeeSwarm(w.targetSerial);
+            return `rejoin attempted (try ${i + 1}/${retries + 1})`;
+        } catch (e) {
+            lastErr = e;
+            await sleep(delayMs);
+        }
+    }
+    return `rejoin failed: ${lastErr?.message || "unknown error"}`;
 }
 
 async function farmPollOnce() {
@@ -347,12 +368,10 @@ async function farmPollOnce() {
 
     const ids = watched.map(w => w.userId);
 
-    const chunks = [];
-    for (let i = 0; i < ids.length; i += 50) chunks.push(ids.slice(i, i + 50));
-
     const presences = [];
-    for (const c of chunks) {
-        const p = await robloxGetPresences(c);
+    for (let i = 0; i < ids.length; i += 50) {
+        const chunk = ids.slice(i, i + 50);
+        const p = await robloxGetPresences(chunk);
         presences.push(...p);
     }
 
@@ -367,66 +386,48 @@ async function farmPollOnce() {
 
     for (const w of watched) {
         let p = byId.get(w.userId);
-
-        if (p && presenceType(p) === 2) {
-            const placeId = getPlaceId(p);
-            const rootPlaceId = getRootPlaceId(p);
-            const lastLoc = getLastLocation(p);
-            const missing = !placeId && !rootPlaceId && !lastLoc;
-            if (missing) {
-                const legacy = await robloxLegacyOnlineStatus(w.userId);
-                if (legacy && typeof legacy === "object") {
-                    p = { ...p, ...legacy };
-                }
-            }
-        }
-
         if (!p) p = { userId: w.userId, userPresenceType: 0, lastLocation: "" };
 
         const farmingNow = isFarmingPresence(p, config.farm);
 
         const prev = farmState.get(w.userId) || {
             lastWasFarming: false,
+            everFarming: false,
             badCount: 0,
             lastAlertAtMs: 0,
             lastPresenceText: "",
         };
 
+        const everFarming = prev.everFarming || farmingNow;
         const badCount = farmingNow ? 0 : (prev.badCount + 1);
 
         const shouldAlert =
-            prev.lastWasFarming === true &&
             farmingNow === false &&
             badCount >= failN &&
             (nowMs - prev.lastAlertAtMs) >= cooldownMs;
 
         if (shouldAlert) {
+            const rejoinNote = await tryAutoRejoinPublic(w, p);
+
             const device = w.targetSerial ? ` (device: **${w.targetSerial}**)` : "";
+            const note = everFarming ? "" : "\nNOTE: monitor has not seen this account farming since start.";
             await farmSend(
-                `🚨 **Farming stopped / disconnected**\n` +
+                `**Not farming / disconnected**\n` +
                 `User: **${w.usernameLower}**${device}\n` +
                 `Now: ${prettyPresence(p)}\n` +
                 `Expected placeId: ${config.farm.placeId}\n` +
+                `bad=${badCount} (threshold=${failN})\n` +
+                `${rejoinNote}` +
+                `${note}\n` +
                 `Time: <t:${Math.floor(nowMs / 1000)}:F>`
             );
-            prev.lastAlertAtMs = nowMs;
 
-            if (config.farm.autoRestart && w.targetSerial) {
-                try {
-                    await closeRoblox(w.targetSerial);
-                    await sleep(1000);
-                    await launchRoblox(w.targetSerial);
-                    await sleep(2000);
-                    await joinBeeSwarm(w.targetSerial);
-                    await farmSend(`✅ Attempted auto-restart on **${w.targetSerial}** for **${w.usernameLower}**`);
-                } catch (e) {
-                    await farmSend(`❌ Auto-restart failed on **${w.targetSerial}** for **${w.usernameLower}**: ${e.message}`);
-                }
-            }
+            prev.lastAlertAtMs = nowMs;
         }
 
         farmState.set(w.userId, {
             lastWasFarming: farmingNow,
+            everFarming,
             badCount,
             lastAlertAtMs: prev.lastAlertAtMs,
             lastPresenceText: prettyPresence(p),
@@ -444,14 +445,35 @@ async function startMonitorLoop() {
             await farmPollOnce();
         } catch (e) {
             console.log("Farm monitor error:", e?.message || e);
+            if (e?.stack) console.log(e.stack);
         }
 
         const ms = Math.max(10, Number(config.farm.pollSeconds || 30)) * 1000;
         await sleep(ms);
     }
 }
-function stopMonitorLoop() {
-    monitorLoopRunning = false;
+
+async function updateBot() {
+    try {
+        await run("git", ["fetch", "origin"]);
+        const localHash = await run("git", ["rev-parse", "HEAD"]);
+        const remoteHash = await run("git", ["rev-parse", "origin/main"]);
+
+        if (localHash === remoteHash) {
+            return "Already up to date.";
+        }
+
+        await run("git", ["pull", "origin", "main"]);
+        await run("npm", ["install"]);
+        await run("npm", ["run", "register"]);
+
+        spawn("npm", ["start"], { detached: true, stdio: "ignore" });
+        process.exit(0);
+
+        return "Updated and restarting...";
+    } catch (e) {
+        return `Update failed: ${e.message}`;
+    }
 }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -462,20 +484,17 @@ client.on("interactionCreate", async (interaction) => {
             await interaction.respond([]);
             return;
         }
-
         const focused = interaction.options.getFocused(true);
         if (focused.name !== "target") {
             await interaction.respond([]);
             return;
         }
-
         const typed = String(focused.value || "").toLowerCase();
         const targets = await getAdbTargets();
         const choices = targets
             .filter((t) => t.serial.toLowerCase().includes(typed))
             .slice(0, 25)
             .map((t) => ({ name: `${t.serial} (${t.state})`, value: t.serial }));
-
         await interaction.respond(choices);
         return;
     }
@@ -492,23 +511,21 @@ client.on("interactionCreate", async (interaction) => {
     try {
         if (interaction.commandName === "minimize-instances") {
             await minimizeInstancesWindows();
-            await interaction.editReply("Minimized emulator instances ✅");
+            await interaction.editReply("Minimized emulator instances");
             return;
         }
 
         if (interaction.commandName === "roblox-open") {
             const target = interaction.options.getString("target", true);
-            await launchRoblox(target);
-            await sleep(2000);
-            await joinBeeSwarm(target);
-            await interaction.editReply(`Opened Roblox + joined Bee Swarm on **${target}** ✅`);
+            await openAndJoinBeeSwarm(target);
+            await interaction.editReply(`Opened Roblox + joined Bee Swarm on **${target}**`);
             return;
         }
 
         if (interaction.commandName === "roblox-close") {
             const target = interaction.options.getString("target", true);
             await closeRoblox(target);
-            await interaction.editReply(`Closed Roblox on **${target}** ✅`);
+            await interaction.editReply(`Closed Roblox on **${target}**`);
             return;
         }
 
@@ -516,8 +533,7 @@ client.on("interactionCreate", async (interaction) => {
             const target = interaction.options.getString("target", true);
             await pressReceiveKeyThenBack(target);
             await interaction.editReply(
-                `Tapped **Receive Key** and returned to Roblox on **${target}** ✅\n` +
-                `Now open the copied link on your PC, get the key, then run /enter-key.`
+                `Tapped **Receive Key** and returned to Roblox on **${target}**\nNow open the copied link on your PC, get the key, then run /enter-key.`
             );
             return;
         }
@@ -526,96 +542,7 @@ client.on("interactionCreate", async (interaction) => {
             const target = interaction.options.getString("target", true);
             const key = interaction.options.getString("key", true);
             await enterKeyAndContinue(target, key);
-            await interaction.editReply(`Entered key + pressed Continue on **${target}** ✅`);
-            return;
-        }
-
-        if (interaction.commandName === "device") {
-            const sub = interaction.options.getSubcommand();
-
-            if (sub === "list") {
-                const targets = await getAdbTargets();
-                if (!targets.length) {
-                    await interaction.editReply("No ADB devices found. Run `adb devices` and ensure MuMu ADB is connected.");
-                    return;
-                }
-                const lines = targets.map(t => `• ${t.serial} (${t.state})`);
-                await interaction.editReply(lines.join("\n").slice(0, 1900));
-                return;
-            }
-
-            if (sub === "coords-show") {
-                const target = interaction.options.getString("target", true);
-                const c = coordsFor(target);
-                const isOverride = !!config.devices.coordsBySerial?.[target];
-                await interaction.editReply(
-                    `Coords for **${target}**: ${isOverride ? "(override)" : "(default)"}\n` +
-                    `receive: (${c.receiveX},${c.receiveY})\n` +
-                    `key: (${c.keyX},${c.keyY})\n` +
-                    `continue: (${c.contX},${c.contY})`
-                );
-                return;
-            }
-
-            if (sub === "coords-clear") {
-                const target = interaction.options.getString("target", true);
-                if (config.devices.coordsBySerial?.[target]) {
-                    delete config.devices.coordsBySerial[target];
-                    await saveConfig(config);
-                    await interaction.editReply(`Cleared coords override for **${target}** ✅`);
-                } else {
-                    await interaction.editReply(`No override exists for **${target}** (already using default).`);
-                }
-                return;
-            }
-
-            if (sub === "coords-default") {
-                config.devices.defaultCoords = {
-                    receiveX: interaction.options.getInteger("receive_x", true),
-                    receiveY: interaction.options.getInteger("receive_y", true),
-                    keyX: interaction.options.getInteger("key_x", true),
-                    keyY: interaction.options.getInteger("key_y", true),
-                    contX: interaction.options.getInteger("cont_x", true),
-                    contY: interaction.options.getInteger("cont_y", true),
-                };
-                await saveConfig(config);
-                await interaction.editReply("Updated DEFAULT coords ✅");
-                return;
-            }
-
-            if (sub === "coords-set") {
-                const target = interaction.options.getString("target", true);
-                config.devices.coordsBySerial[target] = {
-                    receiveX: interaction.options.getInteger("receive_x", true),
-                    receiveY: interaction.options.getInteger("receive_y", true),
-                    keyX: interaction.options.getInteger("key_x", true),
-                    keyY: interaction.options.getInteger("key_y", true),
-                    contX: interaction.options.getInteger("cont_x", true),
-                    contY: interaction.options.getInteger("cont_y", true),
-                };
-                await saveConfig(config);
-                await interaction.editReply(`Updated coords override for **${target}** ✅`);
-                return;
-            }
-
-            if (sub === "minimize-set") {
-                const raw = interaction.options.getString("names", true);
-                const names = raw.split(",").map(s => s.trim()).filter(Boolean);
-                config.devices.minimizeProcessNames = names;
-                await saveConfig(config);
-                await interaction.editReply(`Minimize process list updated ✅\n${names.map(n => `• ${n}`).join("\n")}`.slice(0, 1900));
-                return;
-            }
-
-            if (sub === "minimize-show") {
-                const names = config.devices.minimizeProcessNames || [];
-                await interaction.editReply(
-                    names.length ? names.map(n => `• ${n}`).join("\n") : "No minimize process names set."
-                );
-                return;
-            }
-
-            await interaction.editReply("Unknown /device subcommand.");
+            await interaction.editReply(`Entered key + pressed Continue on **${target}**`);
             return;
         }
 
@@ -625,77 +552,69 @@ client.on("interactionCreate", async (interaction) => {
             if (sub === "set-place") {
                 config.farm.placeId = interaction.options.getInteger("place_id", true);
                 await saveConfig(config);
-                await interaction.editReply(`placeId set to **${config.farm.placeId}** ✅`);
+                await interaction.editReply(`placeId set to **${config.farm.placeId}**`);
                 return;
             }
 
             if (sub === "set-webhook") {
                 config.farm.webhookUrl = interaction.options.getString("url", true).trim();
                 await saveConfig(config);
-                await interaction.editReply("Webhook URL saved ✅");
+                await interaction.editReply("Webhook URL saved");
                 return;
             }
 
             if (sub === "clear-webhook") {
                 config.farm.webhookUrl = "";
                 await saveConfig(config);
-                await interaction.editReply("Webhook cleared ✅");
-                return;
-            }
-
-            if (sub === "test-webhook") {
-                if (!config.farm.webhookUrl) throw new Error("No webhook set. Use /farm set-webhook first.");
-                await farmSend(`✅ Farm monitor test at <t:${Math.floor(Date.now() / 1000)}:F>`);
-                await interaction.editReply("Sent test webhook ✅");
+                await interaction.editReply("Webhook cleared");
                 return;
             }
 
             if (sub === "set-poll") {
                 config.farm.pollSeconds = Math.max(10, interaction.options.getInteger("seconds", true));
                 await saveConfig(config);
-                await interaction.editReply(`Poll interval set to **${config.farm.pollSeconds}s** ✅`);
+                await interaction.editReply(`Poll interval set to **${config.farm.pollSeconds}s**`);
                 return;
             }
 
             if (sub === "set-fails") {
                 config.farm.consecutiveFails = Math.max(1, interaction.options.getInteger("count", true));
                 await saveConfig(config);
-                await interaction.editReply(`Fails threshold set to **${config.farm.consecutiveFails}** ✅`);
+                await interaction.editReply(`Fails threshold set to **${config.farm.consecutiveFails}**`);
                 return;
             }
 
             if (sub === "set-cooldown") {
                 config.farm.cooldownSeconds = Math.max(30, interaction.options.getInteger("seconds", true));
                 await saveConfig(config);
-                await interaction.editReply(`Cooldown set to **${config.farm.cooldownSeconds}s** ✅`);
+                await interaction.editReply(`Cooldown set to **${config.farm.cooldownSeconds}s**`);
                 return;
             }
 
-            if (sub === "set-strict") {
-                config.farm.strictPlaceMatch = interaction.options.getBoolean("enabled", true);
+            if (sub === "set-rejoin") {
+                const enabled = interaction.options.getBoolean("enabled", true);
+                const retries = interaction.options.getInteger("retries", false);
+                const delayMs = interaction.options.getInteger("delay_ms", false);
+                const closeFirst = interaction.options.getBoolean("close_first", false);
+
+                config.farm.autoRejoin = config.farm.autoRejoin || structuredClone(DEFAULT_CONFIG.farm.autoRejoin);
+                config.farm.autoRejoin.enabled = enabled;
+                if (retries !== null && retries !== undefined) config.farm.autoRejoin.retries = Math.max(0, retries);
+                if (delayMs !== null && delayMs !== undefined) config.farm.autoRejoin.delayMs = Math.max(500, delayMs);
+                if (closeFirst !== null && closeFirst !== undefined) config.farm.autoRejoin.closeFirst = !!closeFirst;
+
                 await saveConfig(config);
-                await interaction.editReply(`Strict place match set to **${config.farm.strictPlaceMatch}** ✅`);
+
+                await interaction.editReply(
+                    `Auto rejoin updated\n` +
+                    `enabled=${config.farm.autoRejoin.enabled} retries=${config.farm.autoRejoin.retries} delayMs=${config.farm.autoRejoin.delayMs} closeFirst=${config.farm.autoRejoin.closeFirst}`
+                );
                 return;
             }
 
-            if (sub === "set-cookie") {
-                config.farm.robloxCookie = interaction.options.getString("cookie", true).trim();
-                await saveConfig(config);
-                await interaction.editReply("Roblox cookie saved ✅");
-                return;
-            }
-
-            if (sub === "clear-cookie") {
-                config.farm.robloxCookie = "";
-                await saveConfig(config);
-                await interaction.editReply("Roblox cookie cleared ✅");
-                return;
-            }
-
-            if (sub === "set-autorestart") {
-                config.farm.autoRestart = interaction.options.getBoolean("enabled", true);
-                await saveConfig(config);
-                await interaction.editReply(`Auto-restart set to **${config.farm.autoRestart}** ✅`);
+            if (sub === "update") {
+                const result = await updateBot();
+                await interaction.editReply(result);
                 return;
             }
 
@@ -719,7 +638,7 @@ client.on("interactionCreate", async (interaction) => {
 
                 await saveConfig(config);
                 await interaction.editReply(
-                    `Added **${usernameLower}** (id: ${userId})${targetSerial ? ` mapped to **${targetSerial}**` : ""} ✅`
+                    `Added **${usernameLower}** (id: ${userId})${targetSerial ? ` mapped to **${targetSerial}**` : ""}`
                 );
                 return;
             }
@@ -730,7 +649,7 @@ client.on("interactionCreate", async (interaction) => {
                 config.farm.watch = config.farm.watch.filter(w => w.usernameLower !== usernameLower);
                 await saveConfig(config);
                 await interaction.editReply(
-                    before === config.farm.watch.length ? `Not found: **${usernameLower}**` : `Removed **${usernameLower}** ✅`
+                    before === config.farm.watch.length ? `Not found: **${usernameLower}**` : `Removed **${usernameLower}**`
                 );
                 return;
             }
@@ -750,27 +669,25 @@ client.on("interactionCreate", async (interaction) => {
             if (sub === "start") {
                 config.farm.enabled = true;
                 await saveConfig(config);
-                await interaction.editReply("Farm monitor started ✅");
+                await interaction.editReply("Farm monitor started");
                 return;
             }
 
             if (sub === "stop") {
                 config.farm.enabled = false;
                 await saveConfig(config);
-                await interaction.editReply("Farm monitor stopped ⏸️");
+                await interaction.editReply("Farm monitor stopped");
                 return;
             }
 
             if (sub === "status") {
-                const enabled = config.farm.enabled ? "✅ enabled" : "⏸️ disabled";
+                const enabled = config.farm.enabled ? "enabled" : "disabled";
                 const lines = [
                     `Monitor: ${enabled}`,
                     `placeId: ${config.farm.placeId}`,
                     `poll: ${config.farm.pollSeconds}s | fails: ${config.farm.consecutiveFails} | cooldown: ${config.farm.cooldownSeconds}s`,
-                    `strictPlaceMatch: ${config.farm.strictPlaceMatch}`,
-                    `autoRestart: ${config.farm.autoRestart}`,
+                    `autoRejoin: ${config.farm.autoRejoin?.enabled ? `on (retries=${config.farm.autoRejoin.retries}, delayMs=${config.farm.autoRejoin.delayMs})` : "off"}`,
                     `webhook: ${config.farm.webhookUrl ? "set" : "not set"}`,
-                    `cookie: ${config.farm.robloxCookie ? "set" : "not set"}`,
                     `watching: ${config.farm.watch.length}`,
                     "",
                 ];
@@ -778,7 +695,7 @@ client.on("interactionCreate", async (interaction) => {
                 for (const w of config.farm.watch.slice(0, 15)) {
                     const st = farmState.get(w.userId);
                     const status = st
-                        ? (st.lastWasFarming ? `✅ farming` : `⚠️ not farming (bad=${st.badCount})`)
+                        ? (st.lastWasFarming ? `farming` : `not farming (bad=${st.badCount})`)
                         : "(no data yet)";
                     lines.push(`• ${w.usernameLower}${w.targetSerial ? ` [${w.targetSerial}]` : ""} — ${status}`);
                 }
@@ -798,7 +715,7 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 client.once("ready", async () => {
-    console.log(`✅ Logged in as ${client.user.tag}`);
+    console.log(`Logged in as ${client.user.tag}`);
     await startMonitorLoop();
 });
 
