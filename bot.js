@@ -612,7 +612,7 @@ const commands = [
         .addSubcommand((sc) => sc.setName("status").setDescription("Show current monitor status")),
 ].map((c) => c.toJSON());
 
-client.once("ready", async () => {
+client.once("clientReady", async () => {
     console.log(`Logged in as ${client.user?.tag || "(unknown user)"}`);
 
     try {
