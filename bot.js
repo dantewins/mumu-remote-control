@@ -547,10 +547,36 @@ client.on("interactionCreate", async (interaction) => {
     await interaction.deferReply({ ephemeral: true });
 
     try {
-        if (interaction.commandName === "update-bot") {
-            const result = await updateBot();
-            await interaction.editReply(result);
-            return;
+        if (commandName === 'update-bot') {
+            await interaction.reply('Updating bot from GitHub...');
+
+            try {
+                const { execSync } = require('child_process');
+
+                execSync('git fetch origin', { stdio: 'inherit', shell: true });
+                const status = execSync('git status -uno').toString();
+
+                if (!status.includes('Your branch is behind') && !status.includes('can be fast-forwarded')) {
+                    await interaction.editReply('Bot is already up to date.');
+                    return;
+                }
+
+                await interaction.editReply('New commits found. Pulling changes...');
+
+                execSync('git pull', { stdio: 'inherit', shell: true });
+
+                await interaction.editReply('Installing dependencies...');
+                execSync('npm install', { stdio: 'inherit', shell: true });
+
+                await interaction.editReply('Update complete. Restarting bot...');
+
+                console.log('Update successful. Restarting process...');
+                process.exit(0);
+
+            } catch (error) {
+                console.error(error);
+                await interaction.editReply(`Update failed:\n\`\`\`\n${error.message}\n\`\`\``);
+            }
         }
 
         if (interaction.commandName === "minimize-instances") {
