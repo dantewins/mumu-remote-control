@@ -2,15 +2,18 @@ import "dotenv/config";
 import dns from "node:dns";
 dns.setDefaultResultOrder("ipv4first");
 
-import { Client, GatewayIntentBits, WebhookClient } from "discord.js";
+import {
+    Client,
+    GatewayIntentBits,
+    WebhookClient,
+    SlashCommandBuilder,
+    REST,
+    Routes,
+} from "discord.js";
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import clipboard from 'clipboardy';
-import { promisify } from "node:util";
-import { REST, Routes, SlashCommandBuilder } from "discord.js";
-
-const exec = promisify(execFile);
+import clipboard from "clipboardy";
 
 const ROBLOX_PKG = process.env.ROBLOX_PKG || "com.roblox.client";
 const allowedUsers = new Set(
@@ -28,17 +31,39 @@ function run(cmd, args) {
         });
     });
 }
+
+function resolveCmd(base) {
+    if (process.platform === "win32") {
+        if (base === "npm" || base === "npx") return `${base}.cmd`;
+    }
+    return base;
+}
+
+function runStreaming(cmd, args) {
+    return new Promise((resolve, reject) => {
+        const p = spawn(cmd, args, { stdio: "inherit", windowsHide: true });
+        p.on("error", reject);
+        p.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`${cmd} exited with code ${code}`));
+        });
+    });
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function isTcpSerial(serial) {
     return /^[\d.]+:\d+$/.test(serial);
 }
+
 async function ensureAdbTcpConnected(serial) {
     if (isTcpSerial(serial)) await run("adb", ["connect", serial]);
 }
+
 function sanitizeForAdbText(s) {
     return s.replace(/ /g, "%s").replace(/[\r\n"'`]/g, "");
 }
+
 async function getAdbTargets() {
     let out = "";
     try {
@@ -46,7 +71,10 @@ async function getAdbTargets() {
     } catch {
         return [];
     }
-    const lines = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const lines = out
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
     const deviceLines = lines.slice(1);
     const targets = [];
     for (const line of deviceLines) {
@@ -62,7 +90,14 @@ const CONFIG_PATH = path.resolve("./config.json");
 
 const DEFAULT_CONFIG = {
     devices: {
-        defaultCoords: { receiveX: 1072, receiveY: 463, keyX: 1068, keyY: 296, contX: 1065, contY: 382 },
+        defaultCoords: {
+            receiveX: 1072,
+            receiveY: 463,
+            keyX: 1068,
+            keyY: 296,
+            contX: 1065,
+            contY: 382,
+        },
         coordsBySerial: {},
         minimizeProcessNames: ["MuMuNxDevice", "MuMuVMMHeadless"],
     },
@@ -133,10 +168,12 @@ async function tap(serial, x, y) {
     await ensureAdbTcpConnected(serial);
     await run("adb", ["-s", serial, "shell", "input", "tap", String(x), String(y)]);
 }
+
 async function keyevent(serial, code) {
     await ensureAdbTcpConnected(serial);
     await run("adb", ["-s", serial, "shell", "input", "keyevent", String(code)]);
 }
+
 async function typeText(serial, text) {
     await ensureAdbTcpConnected(serial);
     await run("adb", ["-s", serial, "shell", "input", "text", sanitizeForAdbText(text)]);
@@ -144,24 +181,24 @@ async function typeText(serial, text) {
 
 const publicDeepLink = (placeId) => `roblox://experiences/start?placeId=${placeId}`;
 
-function getVipAccessCode(link) {
-    if (!link) throw new Error("No VIP link set. Use /farm set-vip-link first.");
-    const match = link.match(/[?&]privateServerLinkCode=([^&]+)/);
-    if (!match) throw new Error("Invalid VIP link format.");
-    return match[1];
-}
-
-const vipDeepLink = (placeId, accessCode) => `roblox://experiences/start?placeId=${placeId}&accessCode=${accessCode}`;
-
 async function launchRoblox(serial) {
     await ensureAdbTcpConnected(serial);
     await run("adb", [
-        "-s", serial,
-        "shell", "monkey",
-        "-p", ROBLOX_PKG,
-        "-c", "android.intent.category.LAUNCHER",
+        "-s",
+        serial,
+        "shell",
+        "monkey",
+        "-p",
+        ROBLOX_PKG,
+        "-c",
+        "android.intent.category.LAUNCHER",
         "1",
     ]);
+}
+
+async function closeRoblox(serial) {
+    await ensureAdbTcpConnected(serial);
+    await run("adb", ["-s", serial, "shell", "am", "force-stop", ROBLOX_PKG]);
 }
 
 async function joinBeeSwarm(serial, useVip = false) {
@@ -171,13 +208,18 @@ async function joinBeeSwarm(serial, useVip = false) {
         if (!config.farm.vipLink) throw new Error("No VIP link set. Use /farm set-vip-link first.");
 
         await run("adb", [
-            "-s", serial,
-            "shell", "am", "start",
-            "-a", "android.intent.action.VIEW",
-            "-d", config.farm.vipLink.trim(),
+            "-s",
+            serial,
+            "shell",
+            "am",
+            "start",
+            "-a",
+            "android.intent.action.VIEW",
+            "-d",
+            config.farm.vipLink.trim(),
         ]);
 
-        await sleep(6000);
+        await sleep(7000);
 
         await run("adb", ["-s", serial, "shell", "am", "force-stop", "com.android.chrome"]).catch(() => { });
         await run("adb", ["-s", serial, "shell", "am", "force-stop", "com.android.browser"]).catch(() => { });
@@ -185,10 +227,15 @@ async function joinBeeSwarm(serial, useVip = false) {
     } else {
         const dl = publicDeepLink(config.farm.placeId);
         await run("adb", [
-            "-s", serial,
-            "shell", "am", "start",
-            "-a", "android.intent.action.VIEW",
-            "-d", dl,
+            "-s",
+            serial,
+            "shell",
+            "am",
+            "start",
+            "-a",
+            "android.intent.action.VIEW",
+            "-d",
+            dl,
         ]);
     }
 }
@@ -200,27 +247,33 @@ async function openAndJoinBeeSwarm(serial, useVip = false) {
 }
 
 async function restartRoblox(serial, useVip = false) {
-    await closeRoblox(serial);
+    await closeRoblox(serial).catch(() => { });
     await sleep(1000);
     await openAndJoinBeeSwarm(serial, useVip);
 }
 
-async function closeRoblox(serial) {
-    await ensureAdbTcpConnected(serial);
-    await run("adb", ["-s", serial, "shell", "am", "force-stop", ROBLOX_PKG]);
-}
-
-async function pressReceiveKeyThenBack(serial) {
+async function receiveKeyThenBackAndReadClipboard(serial) {
     const c = coordsFor(serial);
 
     await tap(serial, c.receiveX, c.receiveY);
-    await sleep(700);
+    await sleep(1200);
 
-    await keyevent(serial, 4);
+    let clip = "";
+    try {
+        clip = (await clipboard.read()) || "";
+    } catch {
+        clip = "";
+    }
+
+    await keyevent(serial, 4).catch(() => { });
     await sleep(250);
-    await keyevent(serial, 4);
+    await keyevent(serial, 4).catch(() => { });
 
+    await run("adb", ["-s", serial, "shell", "am", "force-stop", "com.android.chrome"]).catch(() => { });
     await run("adb", ["-s", serial, "shell", "am", "force-stop", "com.android.browser"]).catch(() => { });
+    await run("adb", ["-s", serial, "shell", "am", "force-stop", "org.chromium.webview_shell"]).catch(() => { });
+
+    return clip.trim();
 }
 
 async function enterKeyAndContinue(serial, key) {
@@ -233,13 +286,19 @@ async function enterKeyAndContinue(serial, key) {
     await tap(serial, c.contX, c.contY);
 }
 
+function normalizeProcName(name) {
+    let s = String(name || "").trim();
+    while (/\.exe$/i.test(s)) s = s.slice(0, -4);
+    return s;
+}
+
 async function minimizeInstancesWindows() {
     if (process.platform !== "win32") {
         throw new Error("minimize-instances is implemented for Windows only.");
     }
 
     const names = (config.devices.minimizeProcessNames || [])
-        .map((s) => String(s).trim())
+        .map(normalizeProcName)
         .filter(Boolean);
 
     if (names.length === 0) {
@@ -264,7 +323,7 @@ Get-Process | Where-Object { $names -contains $_.Name } | ForEach-Object {
     [Win32]::ShowWindowAsync($_.MainWindowHandle, 6) | Out-Null
   }
 }
-  `.trim();
+`.trim();
 
     await run("powershell", ["-NoProfile", "-Command", ps]);
 }
@@ -279,7 +338,7 @@ async function postJson(url, body, timeoutMs = 12000) {
     try {
         const res = await fetch(url, {
             method: "POST",
-            headers: { "content-type": "application/json", "accept": "application/json" },
+            headers: { "content-type": "application/json", accept: "application/json" },
             body: JSON.stringify(body),
             signal: controller.signal,
         });
@@ -297,7 +356,7 @@ async function robloxUsernamesToIds(usernames) {
         excludeBannedUsers: false,
     });
     const map = new Map();
-    for (const item of (json?.data || [])) {
+    for (const item of json?.data || []) {
         if (item?.name && typeof item?.id === "number") {
             map.set(String(item.name).toLowerCase(), item.id);
         }
@@ -337,7 +396,7 @@ function isFarmingPresence(p, cfg) {
         return false;
     }
 
-    if (placeId || rootPlaceId) return (placeId == cfg.placeId || rootPlaceId == cfg.placeId);
+    if (placeId || rootPlaceId) return placeId == cfg.placeId || rootPlaceId == cfg.placeId;
     if (lastLoc) return lastLoc.includes("bee swarm");
     return true;
 }
@@ -345,26 +404,34 @@ function isFarmingPresence(p, cfg) {
 function prettyPresence(p) {
     const t = presenceType(p);
     const typeStr =
-        t === 0 ? "Offline" :
-            t === 1 ? "Online" :
-                t === 2 ? "In Game" :
-                    t === 3 ? "In Studio" :
-                        `Unknown(${t})`;
+        t === 0
+            ? "Offline"
+            : t === 1
+                ? "Online"
+                : t === 2
+                    ? "In Game"
+                    : t === 3
+                        ? "In Studio"
+                        : `Unknown(${t})`;
 
     const placeId = getPlaceId(p);
     const rootPlaceId = getRootPlaceId(p);
     const lastLoc = getLastLocation(p);
 
-    return `${typeStr}` +
+    return (
+        `${typeStr}` +
         (placeId ? ` | placeId=${placeId}` : "") +
         (rootPlaceId ? ` | rootPlaceId=${rootPlaceId}` : "") +
-        (lastLoc ? ` | ${lastLoc}` : "");
+        (lastLoc ? ` | ${lastLoc}` : "")
+    );
 }
 
 async function farmSend(msg) {
     const hook = makeWebhookClient(config.farm.webhookUrl);
     if (!hook) return;
-    await hook.send({ content: msg });
+    try {
+        await hook.send({ content: msg });
+    } catch { }
 }
 
 const farmState = new Map();
@@ -399,13 +466,12 @@ async function tryAutoRejoinPublic(w, p, useVip = false) {
 
 async function farmPollOnce() {
     if (!config.farm.enabled) return;
-    if (!config.farm.webhookUrl) return;
     if (!Array.isArray(config.farm.watch) || config.farm.watch.length === 0) return;
 
-    const watched = config.farm.watch.filter(w => typeof w.userId === "number");
+    const watched = config.farm.watch.filter((w) => typeof w.userId === "number");
     if (watched.length === 0) return;
 
-    const ids = watched.map(w => w.userId);
+    const ids = watched.map((w) => w.userId);
 
     const presences = [];
     for (let i = 0; i < ids.length; i += 50) {
@@ -429,27 +495,29 @@ async function farmPollOnce() {
 
         const farmingNow = isFarmingPresence(p, config.farm);
 
-        const prev = farmState.get(w.userId) || {
-            lastWasFarming: false,
-            everFarming: false,
-            badCount: 0,
-            lastAlertAtMs: 0,
-            lastPresenceText: "",
-        };
+        const prev =
+            farmState.get(w.userId) || {
+                lastWasFarming: false,
+                everFarming: false,
+                badCount: 0,
+                lastAlertAtMs: 0,
+                lastPresenceText: "",
+            };
 
         const everFarming = prev.everFarming || farmingNow;
-        const badCount = farmingNow ? 0 : (prev.badCount + 1);
+        const badCount = farmingNow ? 0 : prev.badCount + 1;
 
         const shouldAlert =
             farmingNow === false &&
             badCount >= failN &&
-            (nowMs - prev.lastAlertAtMs) >= cooldownMs;
+            nowMs - prev.lastAlertAtMs >= cooldownMs;
 
         if (shouldAlert) {
             const rejoinNote = await tryAutoRejoinPublic(w, p);
 
             const device = w.targetSerial ? ` (device: **${w.targetSerial}**)` : "";
             const note = everFarming ? "" : "\nNOTE: monitor has not seen this account farming since start.";
+
             await farmSend(
                 `**Not farming / disconnected**\n` +
                 `User: **${w.usernameLower}**${device}\n` +
@@ -492,12 +560,23 @@ async function startMonitorLoop() {
     }
 }
 
+async function gitBehindCount() {
+    try {
+        const out = await run("git", ["rev-list", "--count", "HEAD..@{u}"]);
+        const n = Number.parseInt(out, 10);
+        return Number.isFinite(n) ? n : null;
+    } catch {
+        return null;
+    }
+}
+
 const client = new Client({
     intents: [GatewayIntentBits.Guilds],
 });
 
 const targetRequired = (o) =>
-    o.setName("target")
+    o
+        .setName("target")
         .setDescription("ADB device serial (type to autocomplete)")
         .setRequired(true)
         .setAutocomplete(true);
@@ -507,7 +586,9 @@ const commands = [
         .setName("roblox-open")
         .setDescription("Open Roblox and join Bee Swarm")
         .addStringOption(targetRequired)
-        .addBooleanOption((o) => o.setName("vip").setDescription("Join VIP server if set (default: public)").setRequired(false)),
+        .addBooleanOption((o) =>
+            o.setName("vip").setDescription("Join VIP server if set (default: public)").setRequired(false)
+        ),
 
     new SlashCommandBuilder()
         .setName("roblox-close")
@@ -516,24 +597,18 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName("receive-key")
-        .setDescription("Tap Receive Key then go back to Roblox")
+        .setDescription("Tap Receive Key, return to Roblox, and show the copied link")
         .addStringOption(targetRequired),
 
     new SlashCommandBuilder()
         .setName("enter-key")
         .setDescription("Enter the key in the box and press Continue")
         .addStringOption(targetRequired)
-        .addStringOption((o) =>
-            o.setName("key").setDescription("Paste the key you received").setRequired(true)
-        ),
+        .addStringOption((o) => o.setName("key").setDescription("Paste the key you received").setRequired(true)),
 
-    new SlashCommandBuilder()
-        .setName("minimize-instances")
-        .setDescription("Minimize emulator instances (Windows)"),
+    new SlashCommandBuilder().setName("minimize-instances").setDescription("Minimize emulator instances (Windows)"),
 
-    new SlashCommandBuilder()
-        .setName("update-bot")
-        .setDescription("Update bot from GitHub if new commits available"),
+    new SlashCommandBuilder().setName("update-bot").setDescription("Update bot from GitHub if new commits available"),
 
     new SlashCommandBuilder()
         .setName("farm")
@@ -544,7 +619,8 @@ const commands = [
                 .setDescription("Add a Roblox username to monitor")
                 .addStringOption((o) => o.setName("username").setDescription("Roblox username").setRequired(true))
                 .addStringOption((o) =>
-                    o.setName("target")
+                    o
+                        .setName("target")
                         .setDescription("ADB device serial to map this account to (autocomplete)")
                         .setRequired(false)
                         .setAutocomplete(true)
@@ -591,7 +667,7 @@ const commands = [
         .addSubcommand((sc) =>
             sc
                 .setName("set-rejoin")
-                .setDescription("Auto rejoin Bee Swarm (public) when disconnected")
+                .setDescription("Auto rejoin Bee Swarm when disconnected")
                 .addBooleanOption((o) => o.setName("enabled").setDescription("Enable auto rejoin").setRequired(true))
                 .addIntegerOption((o) => o.setName("retries").setDescription("How many retries (optional)").setRequired(false))
                 .addIntegerOption((o) => o.setName("delay_ms").setDescription("Delay between retries (ms, optional)").setRequired(false))
@@ -609,103 +685,121 @@ const commands = [
                 .setName("restart")
                 .setDescription("Force restart/rejoin on device")
                 .addStringOption(targetRequired)
-                .addBooleanOption((o) => o.setName("vip").setDescription("Join VIP server if set (default: public)").setRequired(false))
+                .addBooleanOption((o) =>
+                    o.setName("vip").setDescription("Join VIP server if set (default: public)").setRequired(false)
+                )
         )
         .addSubcommand((sc) => sc.setName("start").setDescription("Start monitoring"))
         .addSubcommand((sc) => sc.setName("stop").setDescription("Stop monitoring"))
         .addSubcommand((sc) => sc.setName("status").setDescription("Show current monitor status")),
 ].map((c) => c.toJSON());
 
-client.once("clientReady", async () => {
-    console.log(`Logged in as ${client.user.tag}`);
+client.once("ready", async () => {
+    console.log(`Logged in as ${client.user?.tag || "(unknown user)"}`);
 
     try {
         console.log("Registering slash commands...");
         const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 
-        await rest.put(
-            Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-            { body: commands }
-        );
+        await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), {
+            body: commands,
+        });
 
         console.log("Slash commands registered successfully.");
     } catch (error) {
         console.error("Failed to register slash commands:", error);
     }
+
+    startMonitorLoop().catch((e) => console.error("Monitor loop failed:", e));
 });
 
 client.on("interactionCreate", async (interaction) => {
     if (interaction.isAutocomplete()) {
         if (allowedUsers.size > 0 && !allowedUsers.has(interaction.user.id)) {
-            await interaction.respond([]);
+            await interaction.respond([]).catch(() => { });
             return;
         }
-        const focused = interaction.options.getFocused(true);
-        if (focused.name !== "target") {
-            await interaction.respond([]);
+
+        let focused = null;
+        try {
+            focused = interaction.options.getFocused(true);
+        } catch {
+            focused = null;
+        }
+
+        if (!focused || focused.name !== "target") {
+            await interaction.respond([]).catch(() => { });
             return;
         }
+
         const typed = String(focused.value || "").toLowerCase();
         const targets = await getAdbTargets();
         const choices = targets
             .filter((t) => t.serial.toLowerCase().includes(typed))
             .slice(0, 25)
             .map((t) => ({ name: `${t.serial} (${t.state})`, value: t.serial }));
-        await interaction.respond(choices);
+
+        await interaction.respond(choices).catch(() => { });
         return;
     }
 
     if (!interaction.isChatInputCommand()) return;
 
     if (allowedUsers.size > 0 && !allowedUsers.has(interaction.user.id)) {
-        await interaction.reply({ content: "Not authorized.", ephemeral: true });
+        await interaction.reply({ content: "Not authorized.", ephemeral: true }).catch(() => { });
         return;
     }
 
-    await interaction.deferReply({ ephemeral: true });
-
+    await interaction.deferReply({ ephemeral: true }).catch(() => { });
     const commandName = interaction.commandName;
 
     try {
-        if (commandName === 'update-bot') {
-            await interaction.reply('Updating bot from GitHub...');
+        if (commandName === "update-bot") {
+            await interaction.editReply("Checking for updates...");
 
-            try {
-                const { execSync } = require('child_process');
+            await runStreaming("git", ["fetch", "origin"]).catch((e) => {
+                throw new Error(`git fetch failed: ${e.message}`);
+            });
 
-                execSync('git fetch origin', { stdio: 'inherit', shell: true });
-                const status = execSync('git status -uno').toString();
+            const behind = await gitBehindCount();
+            if (behind !== null && behind <= 0) {
+                await interaction.editReply("Bot is already up to date.");
+                return;
+            }
 
-                if (!status.includes('Your branch is behind') && !status.includes('can be fast-forwarded')) {
-                    await interaction.editReply('Bot is already up to date.');
+            if (behind === null) {
+                const status = await run("git", ["status", "-uno"]).catch(() => "");
+                const looksUpToDate =
+                    status.includes("up to date") ||
+                    status.includes("up-to-date") ||
+                    status.includes("Your branch is up to date");
+                if (looksUpToDate) {
+                    await interaction.editReply("Bot is already up to date.");
                     return;
                 }
-
-                await interaction.editReply('New commits found. Pulling changes...');
-
-                execSync('git pull', { stdio: 'inherit', shell: true });
-
-                await interaction.editReply('Installing dependencies...');
-                execSync('npm install', { stdio: 'inherit', shell: true });
-
-                await interaction.editReply('Update complete. Restarting bot...');
-
-                console.log('Update successful. Restarting process...');
-                process.exit(0);
-
-            } catch (error) {
-                console.error(error);
-                await interaction.editReply(`Update failed:\n\`\`\`\n${error.message}\n\`\`\``);
             }
+
+            await interaction.editReply("New commits found. Pulling changes...");
+            await runStreaming("git", ["pull"]).catch((e) => {
+                throw new Error(`git pull failed: ${e.message}`);
+            });
+
+            await interaction.editReply("Installing dependencies...");
+            await runStreaming(resolveCmd("npm"), ["install"]).catch((e) => {
+                throw new Error(`npm install failed: ${e.message}`);
+            });
+
+            await interaction.editReply("Update complete. Restarting bot...");
+            process.exit(0);
         }
 
-        if (interaction.commandName === "minimize-instances") {
+        if (commandName === "minimize-instances") {
             await minimizeInstancesWindows();
             await interaction.editReply("Minimized emulator instances");
             return;
         }
 
-        if (interaction.commandName === "roblox-open") {
+        if (commandName === "roblox-open") {
             const target = interaction.options.getString("target", true);
             const useVip = interaction.options.getBoolean("vip", false) ?? false;
             await openAndJoinBeeSwarm(target, useVip);
@@ -713,38 +807,28 @@ client.on("interactionCreate", async (interaction) => {
             return;
         }
 
-        if (interaction.commandName === "roblox-close") {
+        if (commandName === "roblox-close") {
             const target = interaction.options.getString("target", true);
             await closeRoblox(target);
             await interaction.editReply(`Closed Roblox on **${target}**`);
             return;
         }
 
-        if (commandName === 'receive-key') {
-            const target = interaction.options.getString('target');
+        if (commandName === "receive-key") {
+            const target = interaction.options.getString("target", true);
+            await interaction.editReply("Tapping Receive Key...");
+            const clip = await receiveKeyThenBackAndReadClipboard(target);
 
-            await interaction.deferReply({ ephemeral: true });
-
-            try {
-                const key = await clipboard.read();
-
-                if (!key || key.trim() === '') {
-                    await interaction.editReply('Clipboard is empty.');
-                    return;
-                }
-
-                const trimmedKey = key.trim();
-
-                await interaction.editReply({
-                    content: `Key received:\n\`\`\`\n${trimmedKey}\n\`\`\``,
-                });
-
-            } catch (error) {
-                await interaction.editReply('Failed to read clipboard.');
+            if (!clip) {
+                await interaction.editReply("Clipboard is empty.");
+                return;
             }
+
+            await interaction.editReply(`Key link copied:\n\`\`\`\n${clip}\n\`\`\``);
+            return;
         }
 
-        if (interaction.commandName === "enter-key") {
+        if (commandName === "enter-key") {
             const target = interaction.options.getString("target", true);
             const key = interaction.options.getString("key", true);
             await enterKeyAndContinue(target, key);
@@ -752,7 +836,7 @@ client.on("interactionCreate", async (interaction) => {
             return;
         }
 
-        if (interaction.commandName === "farm") {
+        if (commandName === "farm") {
             const sub = interaction.options.getSubcommand();
 
             if (sub === "set-vip-link") {
@@ -845,7 +929,7 @@ client.on("interactionCreate", async (interaction) => {
                 const userId = map.get(usernameLower);
                 if (!userId) throw new Error(`Could not resolve Roblox username: ${username}`);
 
-                const existing = config.farm.watch.find(w => w.userId === userId || w.usernameLower === usernameLower);
+                const existing = config.farm.watch.find((w) => w.userId === userId || w.usernameLower === usernameLower);
                 if (existing) {
                     existing.usernameLower = usernameLower;
                     existing.userId = userId;
@@ -864,7 +948,7 @@ client.on("interactionCreate", async (interaction) => {
             if (sub === "remove") {
                 const usernameLower = interaction.options.getString("username", true).trim().toLowerCase();
                 const before = config.farm.watch.length;
-                config.farm.watch = config.farm.watch.filter(w => w.usernameLower !== usernameLower);
+                config.farm.watch = config.farm.watch.filter((w) => w.usernameLower !== usernameLower);
                 await saveConfig(config);
                 await interaction.editReply(
                     before === config.farm.watch.length ? `Not found: **${usernameLower}**` : `Removed **${usernameLower}**`
@@ -877,8 +961,8 @@ client.on("interactionCreate", async (interaction) => {
                     await interaction.editReply("Watch list is empty.");
                     return;
                 }
-                const lines = config.farm.watch.map(w =>
-                    `• ${w.usernameLower}${w.targetSerial ? ` [${w.targetSerial}]` : ""} (id: ${w.userId})`
+                const lines = config.farm.watch.map(
+                    (w) => `• ${w.usernameLower}${w.targetSerial ? ` [${w.targetSerial}]` : ""} (id: ${w.userId})`
                 );
                 await interaction.editReply(lines.join("\n").slice(0, 1900));
                 return;
@@ -887,6 +971,7 @@ client.on("interactionCreate", async (interaction) => {
             if (sub === "start") {
                 config.farm.enabled = true;
                 await saveConfig(config);
+                startMonitorLoop().catch(() => { });
                 await interaction.editReply("Farm monitor started");
                 return;
             }
@@ -904,7 +989,10 @@ client.on("interactionCreate", async (interaction) => {
                     `Monitor: ${enabled}`,
                     `placeId: ${config.farm.placeId}`,
                     `poll: ${config.farm.pollSeconds}s | fails: ${config.farm.consecutiveFails} | cooldown: ${config.farm.cooldownSeconds}s`,
-                    `autoRejoin: ${config.farm.autoRejoin?.enabled ? `on (retries=${config.farm.autoRejoin.retries}, delayMs=${config.farm.autoRejoin.delayMs})` : "off"}`,
+                    `autoRejoin: ${config.farm.autoRejoin?.enabled
+                        ? `on (retries=${config.farm.autoRejoin.retries}, delayMs=${config.farm.autoRejoin.delayMs})`
+                        : "off"
+                    }`,
                     `webhook: ${config.farm.webhookUrl ? "set" : "not set"}`,
                     `vipLink: ${config.farm.vipLink ? "set" : "not set"}`,
                     `watching: ${config.farm.watch.length}`,
@@ -913,9 +1001,7 @@ client.on("interactionCreate", async (interaction) => {
 
                 for (const w of config.farm.watch.slice(0, 15)) {
                     const st = farmState.get(w.userId);
-                    const status = st
-                        ? (st.lastWasFarming ? `farming` : `not farming (bad=${st.badCount})`)
-                        : "(no data yet)";
+                    const status = st ? (st.lastWasFarming ? "farming" : `not farming (bad=${st.badCount})`) : "(no data yet)";
                     lines.push(`• ${w.usernameLower}${w.targetSerial ? ` [${w.targetSerial}]` : ""} — ${status}`);
                 }
 
@@ -929,7 +1015,7 @@ client.on("interactionCreate", async (interaction) => {
 
         await interaction.editReply("Unknown command.");
     } catch (e) {
-        await interaction.editReply(`Error: ${e.message}`);
+        await interaction.editReply(`Error: ${e?.message || String(e)}`);
     }
 });
 
