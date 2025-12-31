@@ -399,7 +399,7 @@ async function farmSend(msg) {
     const hook = makeWebhookClient(config.farm.webhookUrl);
     if (!hook) return;
     try {
-        await hook.send({ content: msg });
+        await hook.send({ content: `@everyone ${msg}` });
     } catch { }
 }
 
@@ -612,7 +612,7 @@ const commands = [
         .addSubcommand((sc) => sc.setName("status").setDescription("Show current monitor status")),
 ].map((c) => c.toJSON());
 
-client.once("clientReady", async () => {
+client.once("ready", async () => {
     console.log(`Logged in as ${client.user?.tag || "(unknown user)"}`);
 
     try {
@@ -865,8 +865,16 @@ client.on("interactionCreate", async (interaction) => {
                     await interaction.editReply("Watch list is empty.");
                     return;
                 }
-                const lines = config.farm.watch.map((w) => `• ${w.usernameLower}${w.targetSerial ? ` [${w.targetSerial}]` : ""} (id: ${w.userId})`);
-                await interaction.editReply(lines.join("\n").slice(0, 1900));
+                const lines = [];
+                for (const w of config.farm.watch.slice(0, 15)) {
+                    const st = farmState.get(w.userId);
+                    const status = st ? (st.lastWasFarming ? "farming" : `not farming (bad=${st.badCount})`) : "(no data yet)";
+                    const lastPresence = st ? `\n  Presence: ${st.lastPresenceText}` : "";
+                    const lastAlert = st && st.lastAlertAtMs > 0 ? `\n  Last alert: <t:${Math.floor(st.lastAlertAtMs / 1000)}:R>` : "";
+                    const everFarming = st ? `\n  Ever farming: ${st.everFarming}` : "";
+                    lines.push(`• ${w.usernameLower}${w.targetSerial ? ` [${w.targetSerial}]` : ""} (id: ${w.userId}) — ${status}${lastPresence}${lastAlert}${everFarming}`);
+                }
+                await interaction.editReply(lines.join("\n\n").slice(0, 1900));
                 return;
             }
 
