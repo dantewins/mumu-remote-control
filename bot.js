@@ -566,6 +566,10 @@ const commands = [
         .setName("screenshot")
         .setDescription("Take a screenshot of the device")
         .addStringOption(targetRequired),
+    new SlashCommandBuilder()
+        .setName("reset-key")
+        .setDescription("Force close Roblox and delete /sdcard/delta/Internals folder")
+        .addStringOption(targetRequired),
 ].map((c) => c.toJSON());
 client.once("ready", async () => {
     console.log(`Logged in as ${client.user?.tag || "(unknown user)"}`);
@@ -685,6 +689,14 @@ client.on("interactionCreate", async (interaction) => {
             const buffer = await captureScreenshot(target);
             const attachment = new AttachmentBuilder(buffer, { name: "screenshot.png" });
             await interaction.editReply({ content: `Screenshot from **${target}**:`, files: [attachment] });
+            return;
+        }
+        if (commandName === "reset-key") {
+            const target = interaction.options.getString("target", true);
+            await ensureAdbTcpConnected(target);
+            await closeRoblox(target);
+            await run("adb", ["-s", target, "shell", "rm", "-rf", "/sdcard/delta/Internals"]);
+            await interaction.editReply(`Reset key on **${target}**: Closed Roblox and deleted /sdcard/delta/Internals`);
             return;
         }
         if (commandName === "farm") {
